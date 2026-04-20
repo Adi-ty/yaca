@@ -1,3 +1,18 @@
+# secrets
 .env
-.DS_STORE
+.env.local
+
+# Agents
 CLAUDE.md
+
+# build artifacts
+/yaca
+/yaca.exe
+
+# macOS
+.DS_Store
+
+# editors
+.idea/
+.vscode/
+*.swp
