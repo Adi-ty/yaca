@@ -80,6 +80,8 @@ func (a *Agent) loop(ctx context.Context, userText string) {
 		Content: []ai.ContentBlock{{Type: ai.ContentTypeText, Text: userText}},
 	})
 
+	var totalUsage ai.Usage
+
 	for {
 		a.emit(Event{Type: EventTurnStart})
 
@@ -98,23 +100,25 @@ func (a *Agent) loop(ctx context.Context, userText string) {
 		ch, err := a.cfg.Provider.Stream(ctx, req)
 		if err != nil {
 			a.emit(Event{Type: EventError, Err: fmt.Errorf("agent: start stream: %w", err)})
-			a.emit(Event{Type: EventAgentEnd})
+			a.emit(Event{Type: EventAgentEnd, Usage: totalUsage})
 			return
 		}
 
-		assistantBlocks, ok := a.drainStream(ch)
+		assistantBlocks, turnUsage, ok := a.drainStream(ch)
 		if !ok {
 			// EventError already emitted inside drainStream.
-			a.emit(Event{Type: EventAgentEnd})
+			a.emit(Event{Type: EventAgentEnd, Usage: totalUsage})
 			return
 		}
+		totalUsage.InputTokens += turnUsage.InputTokens
+		totalUsage.OutputTokens += turnUsage.OutputTokens
 
 		a.appendMessage(ai.Message{Role: ai.RoleAssistant, Content: assistantBlocks})
-		a.emit(Event{Type: EventTurnEnd})
+		a.emit(Event{Type: EventTurnEnd, Usage: turnUsage})
 
 		toolCalls := filterType(assistantBlocks, ai.ContentTypeToolCall)
 		if len(toolCalls) == 0 {
-			a.emit(Event{Type: EventAgentEnd})
+			a.emit(Event{Type: EventAgentEnd, Usage: totalUsage})
 			return
 		}
 
@@ -124,9 +128,10 @@ func (a *Agent) loop(ctx context.Context, userText string) {
 }
 
 // drainStream reads from ch, emits subscriber events, and returns the fully
-// assembled assistant content blocks. Returns false on EventError.
-func (a *Agent) drainStream(ch <-chan ai.StreamEvent) ([]ai.ContentBlock, bool) {
+// assembled assistant content blocks plus token usage. Returns false on EventError.
+func (a *Agent) drainStream(ch <-chan ai.StreamEvent) ([]ai.ContentBlock, ai.Usage, bool) {
 	var blocks []ai.ContentBlock
+	var usage ai.Usage
 	var textBuf, thinkBuf strings.Builder
 
 	flushText := func() {
@@ -168,15 +173,18 @@ func (a *Agent) drainStream(ch <-chan ai.StreamEvent) ([]ai.ContentBlock, bool) 
 				ToolInput:  event.ToolInput,
 			})
 
+		case ai.EventDone:
+			usage = event.Usage
+
 		case ai.EventError:
 			a.emit(Event{Type: EventError, Err: event.Err})
-			return nil, false
+			return nil, ai.Usage{}, false
 		}
 	}
 
 	flushThink()
 	flushText()
-	return blocks, true
+	return blocks, usage, true
 }
 
 // executeTools runs each tool call sequentially and returns the result blocks.

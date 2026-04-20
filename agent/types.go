@@ -40,6 +40,10 @@ type Event struct {
 
 	// EventError
 	Err error
+
+	// EventTurnEnd carries the turn's token usage; EventAgentEnd carries the
+	// cumulative total across all turns in this Send() call.
+	Usage ai.Usage
 }
 
 // Tool is an executable capability injected into the agent at startup.
