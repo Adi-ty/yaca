@@ -8,6 +8,7 @@ CLAUDE.md
 # build artifacts
 /yaca
 /yaca.exe
+/yaca-*
 
 # macOS
 .DS_Store
