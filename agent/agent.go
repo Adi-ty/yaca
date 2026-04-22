@@ -9,6 +9,100 @@ import (
 	"github.com/Adi-ty/yaca/ai"
 )
 
+// LoadMessages restores a previous session's message history. Must be called
+// before the first Send.
+func (a *Agent) LoadMessages(msgs []ai.Message) {
+	a.mu.Lock()
+	a.state.Messages = msgs
+	a.mu.Unlock()
+}
+
+// Reset clears the conversation history, starting a fresh session in-memory.
+func (a *Agent) Reset() {
+	a.mu.Lock()
+	a.state.Messages = nil
+	a.mu.Unlock()
+}
+
+// Compact summarises the older portion of the conversation to free context
+// window. The most recent 6 messages are kept verbatim; everything before them
+// is replaced with a single LLM-generated summary.
+func (a *Agent) Compact(ctx context.Context) error {
+	a.mu.RLock()
+	msgs := make([]ai.Message, len(a.state.Messages))
+	copy(msgs, a.state.Messages)
+	a.mu.RUnlock()
+
+	if len(msgs) < 10 {
+		return nil // not enough history to compact
+	}
+
+	const keep = 6
+	toSummarise := msgs[:len(msgs)-keep]
+	recent := msgs[len(msgs)-keep:]
+
+	// Build plain-text transcript for the summariser.
+	var sb strings.Builder
+	for _, m := range toSummarise {
+		sb.WriteString(string(m.Role) + ":\n")
+		for _, b := range m.Content {
+			switch b.Type {
+			case ai.ContentTypeText, ai.ContentTypeThinking:
+				sb.WriteString(b.Text)
+			case ai.ContentTypeToolCall:
+				sb.WriteString("[tool call: " + b.ToolName + "]\n")
+			case ai.ContentTypeToolResult:
+				preview := b.ToolResultContent
+				if len(preview) > 200 {
+					preview = preview[:200] + "…"
+				}
+				sb.WriteString("[tool result: " + preview + "]\n")
+			}
+		}
+		sb.WriteString("\n")
+	}
+
+	resp, err := a.cfg.Provider.Complete(ctx, ai.Request{
+		Model: a.state.Model,
+		System: "You are a conversation summariser. Produce a concise but complete summary " +
+			"of the conversation below, preserving all decisions, file changes, findings, " +
+			"and current task context. Be specific — include filenames, commands run, and " +
+			"any conclusions reached.",
+		Messages: []ai.Message{{
+			Role: ai.RoleUser,
+			Content: []ai.ContentBlock{{
+				Type: ai.ContentTypeText,
+				Text: "Summarise this conversation:\n\n" + sb.String(),
+			}},
+		}},
+		MaxTokens: 2048,
+	})
+	if err != nil {
+		return fmt.Errorf("compact: summarise: %w", err)
+	}
+
+	var summarySB strings.Builder
+	for _, b := range resp.Content {
+		if b.Type == ai.ContentTypeText {
+			summarySB.WriteString(b.Text)
+		}
+	}
+	summary := summarySB.String()
+
+	summaryMsg := ai.Message{
+		Role: ai.RoleUser,
+		Content: []ai.ContentBlock{{
+			Type: ai.ContentTypeText,
+			Text: "[Context summary – earlier conversation compacted]\n" + summary,
+		}},
+	}
+
+	a.mu.Lock()
+	a.state.Messages = append([]ai.Message{summaryMsg}, recent...)
+	a.mu.Unlock()
+	return nil
+}
+
 // Agent runs the tool-call loop for a single conversation session.
 type Agent struct {
 	cfg Config
@@ -187,28 +281,35 @@ func (a *Agent) drainStream(ch <-chan ai.StreamEvent) ([]ai.ContentBlock, ai.Usa
 	return blocks, usage, true
 }
 
-// executeTools runs each tool call sequentially and returns the result blocks.
+// executeTools runs all tool calls concurrently and returns the result blocks
+// in the original order. Events fire in completion order.
 func (a *Agent) executeTools(ctx context.Context, calls []ai.ContentBlock) []ai.ContentBlock {
 	results := make([]ai.ContentBlock, len(calls))
+	var wg sync.WaitGroup
 	for i, call := range calls {
-		result := a.executeTool(ctx, call)
-		results[i] = result
-		a.emit(Event{
-			Type:       EventToolCallEnd,
-			ToolCallID: call.ToolCallID,
-			ToolName:   call.ToolName,
-			ToolInput:  call.ToolInput,
-			ToolResult: result.ToolResultContent,
-			IsError:    result.IsError,
-		})
-		a.emit(Event{
-			Type:       EventToolResult,
-			ToolCallID: call.ToolCallID,
-			ToolName:   call.ToolName,
-			ToolResult: result.ToolResultContent,
-			IsError:    result.IsError,
-		})
+		wg.Add(1)
+		go func(i int, call ai.ContentBlock) {
+			defer wg.Done()
+			result := a.executeTool(ctx, call)
+			results[i] = result
+			a.emit(Event{
+				Type:       EventToolCallEnd,
+				ToolCallID: call.ToolCallID,
+				ToolName:   call.ToolName,
+				ToolInput:  call.ToolInput,
+				ToolResult: result.ToolResultContent,
+				IsError:    result.IsError,
+			})
+			a.emit(Event{
+				Type:       EventToolResult,
+				ToolCallID: call.ToolCallID,
+				ToolName:   call.ToolName,
+				ToolResult: result.ToolResultContent,
+				IsError:    result.IsError,
+			})
+		}(i, call)
 	}
+	wg.Wait()
 	return results
 }
 

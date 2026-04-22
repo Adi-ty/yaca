@@ -3,12 +3,15 @@ package tools
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/Adi-ty/yaca/agent"
 )
@@ -23,6 +26,9 @@ func All() []agent.Tool {
 		GlobTool(),
 		GrepTool(),
 		ListDirTool(),
+		FetchTool(),
+		MemoryReadTool(),
+		MemoryWriteTool(),
 	}
 }
 
@@ -379,4 +385,137 @@ func globMatch(pattern, relPath string) bool {
 	}
 	ok, _ := filepath.Match(pat, rel)
 	return ok
+}
+
+// ── FetchTool ─────────────────────────────────────────────────────────────────
+
+var htmlTagRE = regexp.MustCompile(`<[^>]*>`)
+
+func FetchTool() agent.Tool {
+	return agent.Tool{
+		Name:        "fetch",
+		Description: "Fetch a URL and return its content. Useful for reading documentation, APIs, or GitHub files. HTML is stripped to plain text. Response is truncated at 20 000 characters.",
+		InputSchema: objectSchema(
+			propMap{"url": strProp("The URL to fetch")},
+			[]string{"url"},
+		),
+		Execute: func(ctx context.Context, input map[string]any) (string, error) {
+			url, err := strParam(input, "url")
+			if err != nil {
+				return "", err
+			}
+			client := &http.Client{Timeout: 15 * time.Second}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+			if err != nil {
+				return "", fmt.Errorf("fetch: build request: %w", err)
+			}
+			req.Header.Set("User-Agent", "yaca/1.0")
+			resp, err := client.Do(req)
+			if err != nil {
+				return "", fmt.Errorf("fetch: %w", err)
+			}
+			defer resp.Body.Close()
+
+			const maxBytes = 20_000
+			body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+			if err != nil {
+				return "", fmt.Errorf("fetch: read body: %w", err)
+			}
+			text := string(body)
+			if len(body) > maxBytes {
+				text = text[:maxBytes] + "\n[truncated]"
+			}
+
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				preview := text
+				if len(preview) > 500 {
+					preview = preview[:500]
+				}
+				return fmt.Sprintf("HTTP %d: %s", resp.StatusCode, preview), nil
+			}
+
+			if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "text/html") {
+				text = htmlTagRE.ReplaceAllString(text, "")
+				// Collapse runs of whitespace/blank lines.
+				wsRE := regexp.MustCompile(`\n{3,}`)
+				text = wsRE.ReplaceAllString(strings.TrimSpace(text), "\n\n")
+			}
+			return text, nil
+		},
+	}
+}
+
+// ── MemoryReadTool / MemoryWriteTool ──────────────────────────────────────────
+
+func memoryDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("memory: home dir: %w", err)
+	}
+	d := filepath.Join(home, ".yaca", "memory")
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		return "", fmt.Errorf("memory: create dir: %w", err)
+	}
+	return d, nil
+}
+
+func MemoryReadTool() agent.Tool {
+	return agent.Tool{
+		Name:        "memory_read",
+		Description: "Read a named memory entry saved by memory_write. Returns the content or a 'not found' message.",
+		InputSchema: objectSchema(
+			propMap{"name": strProp("Memory entry name (alphanumeric, hyphens, underscores)")},
+			[]string{"name"},
+		),
+		Execute: func(ctx context.Context, input map[string]any) (string, error) {
+			name, err := strParam(input, "name")
+			if err != nil {
+				return "", err
+			}
+			d, err := memoryDir()
+			if err != nil {
+				return "", err
+			}
+			data, err := os.ReadFile(filepath.Join(d, name+".md"))
+			if os.IsNotExist(err) {
+				return "(no memory named " + name + ")", nil
+			}
+			if err != nil {
+				return "", fmt.Errorf("memory_read: %w", err)
+			}
+			return string(data), nil
+		},
+	}
+}
+
+func MemoryWriteTool() agent.Tool {
+	return agent.Tool{
+		Name:        "memory_write",
+		Description: "Save a named memory entry that persists across sessions. Use this to remember important project context, decisions, or notes.",
+		InputSchema: objectSchema(
+			propMap{
+				"name":    strProp("Memory entry name (alphanumeric, hyphens, underscores)"),
+				"content": strProp("Content to save"),
+			},
+			[]string{"name", "content"},
+		),
+		Execute: func(ctx context.Context, input map[string]any) (string, error) {
+			name, err := strParam(input, "name")
+			if err != nil {
+				return "", err
+			}
+			content, err := strParam(input, "content")
+			if err != nil {
+				return "", err
+			}
+			d, err := memoryDir()
+			if err != nil {
+				return "", err
+			}
+			if err := os.WriteFile(filepath.Join(d, name+".md"), []byte(content), 0o644); err != nil {
+				return "", fmt.Errorf("memory_write: %w", err)
+			}
+			return "saved memory: " + name, nil
+		},
+	}
 }

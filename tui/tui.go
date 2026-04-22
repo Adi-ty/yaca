@@ -40,6 +40,9 @@ var (
 // agentEventMsg carries an agent.Event into Bubbletea's Update loop.
 type agentEventMsg struct{ ev agent.Event }
 
+// compactDoneMsg is sent when a /compact operation finishes.
+type compactDoneMsg struct{ err error }
+
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 // Model is the root Bubbletea model for YACA's terminal UI.
@@ -67,6 +70,10 @@ type Model struct {
 	statusMsg    string
 	inputTokens  int
 	outputTokens int
+
+	// Session support.
+	SessionID    string
+	OnNewSession func() string // called on /new; returns new session ID
 }
 
 // New builds the initial Model. Call SetProgram after tea.NewProgram.
@@ -132,7 +139,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Send on Enter (only when not streaming and input is non-empty).
 			if !m.streaming {
 				if text := strings.TrimSpace(m.ta.Value()); text != "" {
-					m = m.doSend(text)
+					m.ta.Reset()
+					if strings.HasPrefix(text, "/") {
+						var cmd tea.Cmd
+						m, cmd = m.handleSlashCommand(text)
+						cmds = append(cmds, cmd)
+					} else {
+						m = m.doSend(text)
+					}
 					m.vp.SetContent(m.buildViewContent())
 					m.vp.GotoBottom()
 				}
@@ -143,6 +157,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.ta, taCmd = m.ta.Update(msg)
 			cmds = append(cmds, taCmd)
 		}
+
+	case compactDoneMsg:
+		if msg.err != nil {
+			m.content += sError.Render("Compact failed: "+msg.err.Error()) + "\n\n"
+			m.statusMsg = "Error — see above"
+		} else {
+			state := m.ag.State()
+			m.content += sDim.Render(fmt.Sprintf("Context compacted — %d messages kept.", len(state.Messages))) + "\n\n"
+			m.statusMsg = "Ready"
+		}
+		m.vp.SetContent(m.buildViewContent())
+		m.vp.GotoBottom()
 
 	case agentEventMsg:
 		m = m.onAgentEvent(msg.ev)
@@ -258,6 +284,57 @@ func (m Model) doSend(text string) Model {
 	return m
 }
 
+// handleSlashCommand processes TUI slash commands and returns the updated model
+// plus an optional tea.Cmd for async work.
+func (m Model) handleSlashCommand(text string) (Model, tea.Cmd) {
+	parts := strings.Fields(text)
+	if len(parts) == 0 {
+		return m, nil
+	}
+	switch parts[0] {
+	case "/compact":
+		m.statusMsg = "Compacting…"
+		return m, func() tea.Msg {
+			err := m.ag.Compact(context.Background())
+			return compactDoneMsg{err: err}
+		}
+
+	case "/new":
+		if m.OnNewSession != nil {
+			m.SessionID = m.OnNewSession()
+		}
+		m.content = ""
+		m.streaming = false
+		m.statusMsg = "Ready"
+		m.content += sDim.Render("Started new session: "+m.SessionID) + "\n\n"
+		return m, nil
+
+	case "/session":
+		state := m.ag.State()
+		sessID := m.SessionID
+		if sessID == "" {
+			sessID = "(unknown)"
+		}
+		m.content += sDim.Render(fmt.Sprintf(
+			"Session: %s  ·  %d messages  ·  %d in / %d out tokens",
+			sessID, len(state.Messages), m.inputTokens, m.outputTokens,
+		)) + "\n\n"
+		return m, nil
+
+	case "/help":
+		help := "/compact  — summarise older messages to free context\n" +
+			"/new      — start a fresh session\n" +
+			"/session  — show session ID and stats\n" +
+			"/help     — show this help"
+		m.content += sDim.Render(help) + "\n\n"
+		return m, nil
+
+	default:
+		m.content += sError.Render("Unknown command: "+parts[0]+" (try /help)") + "\n\n"
+		return m, nil
+	}
+}
+
 // ── rendering helpers ─────────────────────────────────────────────────────────
 
 // buildViewContent returns the full viewport string: completed history plus the
@@ -285,7 +362,16 @@ func (m Model) buildViewContent() string {
 }
 
 func (m Model) renderHeader() string {
-	return sHeader.Render("YACA") + sDim.Render("  "+m.providerName+" / "+m.modelName)
+	sess := ""
+	if m.SessionID != "" {
+		// Show last 8 chars of the session ID to save space.
+		id := m.SessionID
+		if len(id) > 8 {
+			id = id[len(id)-8:]
+		}
+		sess = "  · sess:" + id
+	}
+	return sHeader.Render("YACA") + sDim.Render("  "+m.providerName+" / "+m.modelName+sess)
 }
 
 func (m Model) doneStatus() string {
