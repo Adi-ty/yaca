@@ -3,11 +3,13 @@ package tui
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Adi-ty/yaca/agent"
@@ -15,9 +17,9 @@ import (
 
 // Fixed line counts for layout arithmetic.
 const (
-	headerLines = 2 // title line + separator
+	headerLines = 2 // title + separator
 	inputLines  = 3 // textarea height
-	footerLines = 2 // separator + status line
+	footerLines = 2 // separator + status
 )
 
 // ── styles ────────────────────────────────────────────────────────────────────
@@ -33,70 +35,72 @@ var (
 	sError      = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
 	sStatus     = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	sSep        = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	sPath       = lipgloss.NewStyle().Foreground(lipgloss.Color("69"))
 )
 
 // ── message types ─────────────────────────────────────────────────────────────
 
-// agentEventMsg carries an agent.Event into Bubbletea's Update loop.
 type agentEventMsg struct{ ev agent.Event }
-
-// compactDoneMsg is sent when a /compact operation finishes.
 type compactDoneMsg struct{ err error }
 
 // ── Model ─────────────────────────────────────────────────────────────────────
 
-// Model is the root Bubbletea model for YACA's terminal UI.
 type Model struct {
 	ag           *agent.Agent
 	providerName string
 	modelName    string
+	projectDir   string // absolute path of current project
 
-	vp    viewport.Model
-	ta    textarea.Model
-	ready bool
-	width int
+	vp     viewport.Model
+	ta     textarea.Model
+	ready  bool
+	width  int
 	height int
+
+	// Glamour renderer — recreated on resize.
+	renderer *glamour.TermRenderer
 
 	// content holds all completed, rendered conversation turns.
 	content string
 
 	// In-flight turn state (reset by flushTurn on EventTurnEnd).
 	streaming bool
-	thinkBuf  string // accumulated thinking deltas
-	streamBuf string // accumulated text deltas
-	toolLines string // ⚙ indicator lines for tool calls in this turn
+	thinkBuf  string
+	streamBuf string
+	toolLines string
 
 	// Status bar.
 	statusMsg    string
 	inputTokens  int
 	outputTokens int
 
-	// Session support.
+	// Session management.
 	SessionID    string
-	OnNewSession func() string // called on /new; returns new session ID
+	OnNewSession func() string
 }
 
-// New builds the initial Model. Call SetProgram after tea.NewProgram.
-func New(ag *agent.Agent, providerName, modelName string) Model {
+// New builds the initial Model.
+func New(ag *agent.Agent, providerName, modelName, projectDir string) Model {
 	ta := textarea.New()
-	ta.Placeholder = "Message… (Enter to send, Ctrl+C to quit)"
+	ta.Placeholder = "Message… (Enter to send, Shift+Enter for newline, Ctrl+C to quit)"
 	ta.Focus()
 	ta.ShowLineNumbers = false
 	ta.SetHeight(inputLines)
-	// Disable Enter→newline so we can intercept Enter to send.
+	// Keep Shift+Enter for newlines; intercept plain Enter to send.
 	ta.KeyMap.InsertNewline.SetEnabled(false)
 
+	abs, _ := filepath.Abs(projectDir)
 	return Model{
 		ag:           ag,
 		providerName: providerName,
 		modelName:    modelName,
+		projectDir:   abs,
 		ta:           ta,
 		statusMsg:    "Ready",
 	}
 }
 
-// SetProgram stores the tea.Program reference and starts the goroutine that
-// relays agent events into Bubbletea's message loop via p.Send.
+// SetProgram bridges agent events into Bubbletea's message loop.
 func (m *Model) SetProgram(p *tea.Program) {
 	ch := m.ag.Subscribe()
 	go func() {
@@ -128,6 +132,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.vp.Height = vpH
 		}
 		m.ta.SetWidth(m.width)
+		// Recreate glamour renderer with correct width.
+		m.renderer = newRenderer(m.width)
 		m.vp.SetContent(m.buildViewContent())
 
 	case tea.KeyMsg:
@@ -136,7 +142,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case tea.KeyEnter:
-			// Send on Enter (only when not streaming and input is non-empty).
 			if !m.streaming {
 				if text := strings.TrimSpace(m.ta.Value()); text != "" {
 					m.ta.Reset()
@@ -153,18 +158,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		default:
-			var taCmd tea.Cmd
-			m.ta, taCmd = m.ta.Update(msg)
-			cmds = append(cmds, taCmd)
+			// Shift+Enter inserts a newline.
+			if msg.Type == tea.KeyShiftDown || msg.Alt && msg.Type == tea.KeyEnter {
+				m.ta.InsertString("\n")
+			} else {
+				var taCmd tea.Cmd
+				m.ta, taCmd = m.ta.Update(msg)
+				cmds = append(cmds, taCmd)
+			}
 		}
 
 	case compactDoneMsg:
 		if msg.err != nil {
 			m.content += sError.Render("Compact failed: "+msg.err.Error()) + "\n\n"
-			m.statusMsg = "Error — see above"
+			m.statusMsg = "Error"
 		} else {
 			state := m.ag.State()
-			m.content += sDim.Render(fmt.Sprintf("Context compacted — %d messages kept.", len(state.Messages))) + "\n\n"
+			m.content += sDim.Render(fmt.Sprintf("Context compacted — %d messages retained.", len(state.Messages))) + "\n\n"
 			m.statusMsg = "Ready"
 		}
 		m.vp.SetContent(m.buildViewContent())
@@ -176,7 +186,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.vp.GotoBottom()
 	}
 
-	// Always forward to viewport so PgUp/PgDn/mouse scrolling works.
 	var vpCmd tea.Cmd
 	m.vp, vpCmd = m.vp.Update(msg)
 	cmds = append(cmds, vpCmd)
@@ -211,20 +220,18 @@ func (m Model) onAgentEvent(ev agent.Event) Model {
 		m.thinkBuf += ev.Delta
 
 	case agent.EventToolCallStart:
-		m.toolLines += sToolCall.Render("⚙  "+ev.ToolName+"(…)") + "\n"
+		label := toolCallLabel(ev.ToolName, ev.ToolInput)
+		m.toolLines += sToolCall.Render("⤷  "+label) + "\n"
 
 	case agent.EventToolCallEnd:
-		// Append the execution result under the completed history.
-		preview := ev.ToolResult
-		if runes := []rune(preview); len(runes) > 200 {
-			preview = string(runes[:200]) + "…"
-		}
-		label := "✓  " + ev.ToolName + ": " + preview
+		// Append to toolLines so ordering is correct: start (⤷) always
+		// precedes result (✓/✗) and the whole block lands inside the
+		// "Assistant" section that flushTurn creates on EventTurnEnd.
+		label := toolResultLabel(ev.ToolName, ev.ToolInput, ev.ToolResult)
 		if ev.IsError {
-			label = "✗  " + ev.ToolName + ": " + preview
-			m.content += sError.Render(label) + "\n"
+			m.toolLines += sError.Render("✗  "+label) + "\n"
 		} else {
-			m.content += sToolResult.Render(label) + "\n"
+			m.toolLines += sToolResult.Render("✓  "+label) + "\n"
 		}
 
 	case agent.EventTurnEnd:
@@ -250,17 +257,22 @@ func (m Model) onAgentEvent(ev agent.Event) Model {
 	return m
 }
 
-// flushTurn moves the in-flight turn buffers into the completed content string.
+// flushTurn moves in-flight buffers into the immutable content string,
+// running the text through glamour for markdown rendering.
 func (m Model) flushTurn() Model {
 	hasContent := m.thinkBuf != "" || m.streamBuf != "" || m.toolLines != ""
 	if hasContent {
 		var sb strings.Builder
 		sb.WriteString(sAssistant.Render("Assistant") + "\n")
 		if m.thinkBuf != "" {
-			sb.WriteString(sThinking.Render(m.thinkBuf) + "\n")
+			sb.WriteString(sThinking.Render("💭 "+m.thinkBuf) + "\n")
 		}
 		if m.streamBuf != "" {
-			sb.WriteString(m.streamBuf + "\n")
+			rendered := m.renderMarkdown(m.streamBuf)
+			sb.WriteString(rendered)
+			if !strings.HasSuffix(rendered, "\n") {
+				sb.WriteByte('\n')
+			}
 		}
 		if m.toolLines != "" {
 			sb.WriteString(m.toolLines)
@@ -273,19 +285,29 @@ func (m Model) flushTurn() Model {
 	return m
 }
 
-// doSend records the user message, marks streaming active, and fires the agent.
+// renderMarkdown runs text through glamour if a renderer is available,
+// falling back to plain text on any error.
+func (m Model) renderMarkdown(text string) string {
+	if m.renderer == nil {
+		return text
+	}
+	rendered, err := m.renderer.Render(text)
+	if err != nil {
+		return text
+	}
+	return rendered
+}
+
+// doSend fires the agent and records the user message.
 func (m Model) doSend(text string) Model {
-	m.ta.Reset()
 	m.content += sUser.Render("You") + "\n" + text + "\n\n"
 	m.streaming = true
 	m.statusMsg = "Streaming…"
-	// agent.Send is non-blocking (starts its own goroutine internally).
 	m.ag.Send(context.Background(), text)
 	return m
 }
 
-// handleSlashCommand processes TUI slash commands and returns the updated model
-// plus an optional tea.Cmd for async work.
+// handleSlashCommand processes /commands.
 func (m Model) handleSlashCommand(text string) (Model, tea.Cmd) {
 	parts := strings.Fields(text)
 	if len(parts) == 0 {
@@ -306,25 +328,25 @@ func (m Model) handleSlashCommand(text string) (Model, tea.Cmd) {
 		m.content = ""
 		m.streaming = false
 		m.statusMsg = "Ready"
-		m.content += sDim.Render("Started new session: "+m.SessionID) + "\n\n"
+		m.content += sDim.Render("New session: "+m.SessionID) + "\n\n"
 		return m, nil
 
 	case "/session":
 		state := m.ag.State()
-		sessID := m.SessionID
-		if sessID == "" {
-			sessID = "(unknown)"
+		id := m.SessionID
+		if id == "" {
+			id = "(unknown)"
 		}
 		m.content += sDim.Render(fmt.Sprintf(
 			"Session: %s  ·  %d messages  ·  %d in / %d out tokens",
-			sessID, len(state.Messages), m.inputTokens, m.outputTokens,
+			id, len(state.Messages), m.inputTokens, m.outputTokens,
 		)) + "\n\n"
 		return m, nil
 
 	case "/help":
 		help := "/compact  — summarise older messages to free context\n" +
 			"/new      — start a fresh session\n" +
-			"/session  — show session ID and stats\n" +
+			"/session  — show session ID and token stats\n" +
 			"/help     — show this help"
 		m.content += sDim.Render(help) + "\n\n"
 		return m, nil
@@ -337,8 +359,6 @@ func (m Model) handleSlashCommand(text string) (Model, tea.Cmd) {
 
 // ── rendering helpers ─────────────────────────────────────────────────────────
 
-// buildViewContent returns the full viewport string: completed history plus the
-// in-flight streaming turn (if any).
 func (m Model) buildViewContent() string {
 	if !m.streaming || (m.thinkBuf == "" && m.streamBuf == "" && m.toolLines == "") {
 		return m.content
@@ -347,12 +367,13 @@ func (m Model) buildViewContent() string {
 	sb.WriteString(m.content)
 	sb.WriteString(sAssistant.Render("Assistant") + "\n")
 	if m.thinkBuf != "" {
-		sb.WriteString(sThinking.Render(m.thinkBuf) + "\n")
+		sb.WriteString(sThinking.Render("💭 "+m.thinkBuf) + "\n")
 	}
 	if m.streamBuf != "" {
+		// Show raw streaming text (not yet complete for glamour).
 		sb.WriteString(m.streamBuf)
 		if !strings.HasSuffix(m.streamBuf, "\n") && m.toolLines != "" {
-			sb.WriteString("\n")
+			sb.WriteByte('\n')
 		}
 	}
 	if m.toolLines != "" {
@@ -362,16 +383,28 @@ func (m Model) buildViewContent() string {
 }
 
 func (m Model) renderHeader() string {
+	dir := m.projectDir
+	if dir == "" {
+		dir = "."
+	}
+	// Show only last 2 path components to save space.
+	parts := strings.Split(filepath.ToSlash(dir), "/")
+	if len(parts) > 2 {
+		dir = "…/" + strings.Join(parts[len(parts)-2:], "/")
+	}
+
 	sess := ""
 	if m.SessionID != "" {
-		// Show last 8 chars of the session ID to save space.
 		id := m.SessionID
 		if len(id) > 8 {
 			id = id[len(id)-8:]
 		}
 		sess = "  · sess:" + id
 	}
-	return sHeader.Render("YACA") + sDim.Render("  "+m.providerName+" / "+m.modelName+sess)
+
+	return sHeader.Render("YACA") +
+		sDim.Render("  "+m.providerName+" / "+m.modelName+sess) +
+		"  " + sPath.Render(dir)
 }
 
 func (m Model) doneStatus() string {
@@ -400,6 +433,142 @@ func (m Model) vpHeight() int {
 		return 1
 	}
 	return h
+}
+
+// newRenderer creates a glamour renderer for the given terminal width.
+func newRenderer(width int) *glamour.TermRenderer {
+	w := width - 4
+	if w < 40 {
+		w = 40
+	}
+	r, err := glamour.NewTermRenderer(
+		glamour.WithAutoStyle(),
+		glamour.WithWordWrap(w),
+	)
+	if err != nil {
+		return nil
+	}
+	return r
+}
+
+// ── tool label helpers ────────────────────────────────────────────────────────
+
+// toolCallLabel returns a compact one-line description of an in-progress call.
+func toolCallLabel(name string, input map[string]any) string {
+	switch name {
+	case "read":
+		return "read  " + sPath.Render(shortPath(strIn(input, "path")))
+	case "write":
+		return "write  " + sPath.Render(shortPath(strIn(input, "path")))
+	case "edit":
+		return "edit  " + sPath.Render(shortPath(strIn(input, "path")))
+	case "bash":
+		cmd := strIn(input, "command")
+		if len(cmd) > 60 {
+			cmd = cmd[:60] + "…"
+		}
+		return "bash  " + cmd
+	case "glob":
+		return "glob  " + strIn(input, "pattern")
+	case "grep":
+		pat := strIn(input, "pattern")
+		if inc := strIn(input, "include"); inc != "" {
+			pat += "  [" + inc + "]"
+		}
+		return "grep  " + pat
+	case "list_dir":
+		return "list_dir  " + sPath.Render(shortPath(strIn(input, "path")))
+	case "fetch":
+		u := strIn(input, "url")
+		if len(u) > 60 {
+			u = u[:60] + "…"
+		}
+		return "fetch  " + u
+	case "memory_read":
+		return "memory_read  " + strIn(input, "name")
+	case "memory_write":
+		return "memory_write  " + strIn(input, "name")
+	}
+	return name
+}
+
+// toolResultLabel returns a compact summary after a tool finishes.
+func toolResultLabel(name string, input map[string]any, result string) string {
+	switch name {
+	case "read":
+		lines := strings.Count(result, "\n") + 1
+		return fmt.Sprintf("read  %s  (%d lines)", sPath.Render(shortPath(strIn(input, "path"))), lines)
+	case "write":
+		return "write  " + sPath.Render(shortPath(strIn(input, "path")))
+	case "edit":
+		return "edit  " + sPath.Render(shortPath(strIn(input, "path")))
+	case "bash":
+		cmd := strIn(input, "command")
+		if len(cmd) > 40 {
+			cmd = cmd[:40] + "…"
+		}
+		preview := firstLine(result)
+		if preview != "" {
+			return "bash  " + cmd + "\n     " + sDim.Render(preview)
+		}
+		return "bash  " + cmd
+	case "glob":
+		n := len(strings.Split(strings.TrimSpace(result), "\n"))
+		if result == "no files found" {
+			n = 0
+		}
+		return fmt.Sprintf("glob  %s  (%d files)", strIn(input, "pattern"), n)
+	case "grep":
+		n := len(strings.Split(strings.TrimSpace(result), "\n"))
+		if result == "no matches found" {
+			n = 0
+		}
+		return fmt.Sprintf("grep  %s  (%d matches)", strIn(input, "pattern"), n)
+	case "fetch":
+		u := strIn(input, "url")
+		if len(u) > 50 {
+			u = u[:50] + "…"
+		}
+		bytes := len(result)
+		return fmt.Sprintf("fetch  %s  (%d chars)", u, bytes)
+	case "memory_write":
+		return "memory_write  " + strIn(input, "name")
+	case "memory_read":
+		return "memory_read  " + strIn(input, "name")
+	}
+	preview := result
+	if len(preview) > 80 {
+		preview = preview[:80] + "…"
+	}
+	return name + "  " + preview
+}
+
+func strIn(input map[string]any, key string) string {
+	v, _ := input[key].(string)
+	return v
+}
+
+func shortPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	// Show at most last 3 path components.
+	parts := strings.Split(filepath.ToSlash(p), "/")
+	if len(parts) > 3 {
+		return "…/" + strings.Join(parts[len(parts)-3:], "/")
+	}
+	return p
+}
+
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+		s = s[:idx]
+	}
+	if len(s) > 80 {
+		s = s[:80] + "…"
+	}
+	return s
 }
 
 // tokenCostRates maps model ID → [inputPer1M, outputPer1M] in USD.

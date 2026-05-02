@@ -16,6 +16,9 @@ import (
 	"github.com/Adi-ty/yaca/agent"
 )
 
+// memoryNameRE validates memory entry names to prevent path traversal.
+var memoryNameRE = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
 // All returns every built-in tool.
 func All() []agent.Tool {
 	return []agent.Tool{
@@ -37,9 +40,9 @@ func All() []agent.Tool {
 func ReadTool() agent.Tool {
 	return agent.Tool{
 		Name:        "read",
-		Description: "Read the full contents of a file and return them as a string.",
+		Description: "Read the contents of a file and return them as a string. Large files are truncated at 2000 lines.",
 		InputSchema: objectSchema(
-			propMap{"path": strProp("Absolute path to the file to read")},
+			propMap{"path": strProp("Path to the file to read (absolute, or relative to the working directory)")},
 			[]string{"path"},
 		),
 		Execute: func(ctx context.Context, input map[string]any) (string, error) {
@@ -51,7 +54,14 @@ func ReadTool() agent.Tool {
 			if err != nil {
 				return "", fmt.Errorf("read: %w", err)
 			}
-			return string(data), nil
+			const maxLines = 2000
+			content := string(data)
+			lines := strings.Split(content, "\n")
+			if len(lines) > maxLines {
+				return fmt.Sprintf("[truncated: showing first %d of %d lines]\n%s",
+					maxLines, len(lines), strings.Join(lines[:maxLines], "\n")), nil
+			}
+			return content, nil
 		},
 	}
 }
@@ -64,8 +74,8 @@ func WriteTool() agent.Tool {
 		Description: "Write content to a file, creating parent directories as needed. Overwrites existing files.",
 		InputSchema: objectSchema(
 			propMap{
-				"path":    strProp("Absolute path of the file to write"),
-				"content": strProp("Content to write to the file"),
+				"path":    strProp("Path to the file to write (absolute, or relative to the working directory)"),
+				"content": strProp("Complete content to write to the file"),
 			},
 			[]string{"path", "content"},
 		),
@@ -97,7 +107,7 @@ func EditTool() agent.Tool {
 		Description: "Replace an exact string in a file. old_string must appear exactly once; use read first to verify uniqueness.",
 		InputSchema: objectSchema(
 			propMap{
-				"path":       strProp("Absolute path to the file to edit"),
+				"path":       strProp("Path to the file to edit (absolute, or relative to the working directory)"),
 				"old_string": strProp("Exact string to find and replace (must appear exactly once in the file)"),
 				"new_string": strProp("Replacement string"),
 			},
@@ -142,9 +152,12 @@ func EditTool() agent.Tool {
 func BashTool() agent.Tool {
 	return agent.Tool{
 		Name:        "bash",
-		Description: "Execute a bash command and return combined stdout and stderr. Non-zero exit codes are surfaced in output, not as errors.",
+		Description: "Execute a bash command and return combined stdout+stderr. Non-zero exit codes appear in output, not as errors. Default timeout is 120 seconds.",
 		InputSchema: objectSchema(
-			propMap{"command": strProp("The bash command to execute")},
+			propMap{
+				"command": strProp("The bash command to execute"),
+				"timeout": strProp("Timeout in seconds (optional, default 120)"),
+			},
 			[]string{"command"},
 		),
 		Execute: func(ctx context.Context, input map[string]any) (string, error) {
@@ -152,14 +165,24 @@ func BashTool() agent.Tool {
 			if err != nil {
 				return "", err
 			}
-			cmd := exec.CommandContext(ctx, "bash", "-c", command)
+
+			// Apply per-call timeout (default 120 s).
+			timeout := 120 * time.Second
+			if v, ok := input["timeout"]; ok {
+				if n, ok := v.(float64); ok && n > 0 {
+					timeout = time.Duration(n) * time.Second
+				}
+			}
+			cmdCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+
+			cmd := exec.CommandContext(cmdCtx, "bash", "-c", command)
 			out, cmdErr := cmd.CombinedOutput()
 			output := string(out)
 			// Context cancellation / timeout is a real error worth surfacing.
-			if ctx.Err() != nil {
-				return output, fmt.Errorf("bash: %w", ctx.Err())
+			if cmdCtx.Err() != nil {
+				return output, fmt.Errorf("bash: %w", cmdCtx.Err())
 			}
-			// Non-zero exit is not an agent-level error — stderr is in output.
 			_ = cmdErr
 			return output, nil
 		},
@@ -294,7 +317,7 @@ func ListDirTool() agent.Tool {
 		Name:        "list_dir",
 		Description: "List the entries of a directory. Directories are shown with a trailing /.",
 		InputSchema: objectSchema(
-			propMap{"path": strProp("Path to the directory to list")},
+			propMap{"path": strProp("Path to the directory to list (absolute, or relative to the working directory)")},
 			[]string{"path"},
 		),
 		Execute: func(ctx context.Context, input map[string]any) (string, error) {
@@ -472,6 +495,9 @@ func MemoryReadTool() agent.Tool {
 			if err != nil {
 				return "", err
 			}
+			if !memoryNameRE.MatchString(name) {
+				return "", fmt.Errorf("memory_read: invalid name %q — use alphanumeric, hyphens, or underscores only", name)
+			}
 			d, err := memoryDir()
 			if err != nil {
 				return "", err
@@ -503,6 +529,9 @@ func MemoryWriteTool() agent.Tool {
 			name, err := strParam(input, "name")
 			if err != nil {
 				return "", err
+			}
+			if !memoryNameRE.MatchString(name) {
+				return "", fmt.Errorf("memory_write: invalid name %q — use alphanumeric, hyphens, or underscores only", name)
 			}
 			content, err := strParam(input, "content")
 			if err != nil {

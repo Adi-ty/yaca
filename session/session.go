@@ -1,6 +1,12 @@
+// Package session persists conversation history per project.
+// Sessions are stored at ~/.yaca/sessions/<project-hash>/<timestamp>.json
+// where the hash is derived from the absolute project path, so each
+// directory gets its own isolated session history.
 package session
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,37 +19,54 @@ import (
 
 // Session captures a full conversation history with metadata.
 type Session struct {
-	ID        string       `json:"id"`
-	CreatedAt time.Time    `json:"created_at"`
-	Model     string       `json:"model"`
-	Messages  []ai.Message `json:"messages"`
+	ID          string       `json:"id"`
+	CreatedAt   time.Time    `json:"created_at"`
+	Model       string       `json:"model"`
+	ProjectPath string       `json:"project_path"`
+	Messages    []ai.Message `json:"messages"`
 }
 
-// dir returns (creating if needed) the ~/.yaca/sessions directory.
-func dir() (string, error) {
+// projectHash returns an 8-character hex hash of the absolute path.
+// This creates a stable short identifier for the sessions subdirectory.
+func projectHash(projectPath string) string {
+	abs, err := filepath.Abs(projectPath)
+	if err != nil {
+		abs = projectPath
+	}
+	h := sha256.Sum256([]byte(abs))
+	return hex.EncodeToString(h[:4]) // 4 bytes = 8 hex chars
+}
+
+// dir returns (creating if needed) the ~/.yaca/sessions/<hash> directory
+// for the given project path.
+func dir(projectPath string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("session: home dir: %w", err)
 	}
-	d := filepath.Join(home, ".yaca", "sessions")
+	hash := projectHash(projectPath)
+	d := filepath.Join(home, ".yaca", "sessions", hash)
 	if err := os.MkdirAll(d, 0o755); err != nil {
 		return "", fmt.Errorf("session: create dir: %w", err)
 	}
 	return d, nil
 }
 
-// New creates a fresh in-memory session; call Save to persist it.
-func New(model string) *Session {
+// New creates a fresh in-memory session for projectPath; call Save to persist it.
+func New(model, projectPath string) *Session {
+	abs, _ := filepath.Abs(projectPath)
+	// Include milliseconds to avoid collisions when /new is invoked rapidly.
 	return &Session{
-		ID:        time.Now().Format("20060102-150405"),
-		CreatedAt: time.Now(),
-		Model:     model,
+		ID:          time.Now().Format("20060102-150405.000"),
+		CreatedAt:   time.Now(),
+		Model:       model,
+		ProjectPath: abs,
 	}
 }
 
-// Save writes the session to ~/.yaca/sessions/<id>.json.
+// Save writes the session to ~/.yaca/sessions/<hash>/<id>.json.
 func (s *Session) Save() error {
-	d, err := dir()
+	d, err := dir(s.ProjectPath)
 	if err != nil {
 		return err
 	}
@@ -54,9 +77,9 @@ func (s *Session) Save() error {
 	return os.WriteFile(filepath.Join(d, s.ID+".json"), data, 0o644)
 }
 
-// Load reads a session from disk by ID.
-func Load(id string) (*Session, error) {
-	d, err := dir()
+// Load reads a session from disk by project path and ID.
+func Load(projectPath, id string) (*Session, error) {
+	d, err := dir(projectPath)
 	if err != nil {
 		return nil, err
 	}
@@ -71,9 +94,10 @@ func Load(id string) (*Session, error) {
 	return &s, nil
 }
 
-// Latest returns the most recently saved session, or nil if none exist.
-func Latest() (*Session, error) {
-	d, err := dir()
+// Latest returns the most recently saved session for projectPath, or nil
+// if no sessions exist for this project.
+func Latest(projectPath string) (*Session, error) {
+	d, err := dir(projectPath)
 	if err != nil {
 		return nil, err
 	}
@@ -92,5 +116,5 @@ func Latest() (*Session, error) {
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(names)))
 	id := names[0][:len(names[0])-5] // strip .json
-	return Load(id)
+	return Load(projectPath, id)
 }
