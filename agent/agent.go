@@ -353,7 +353,11 @@ func (a *Agent) emit(e Event) {
 	a.subsMu.Unlock()
 
 	for _, ch := range subs {
-		ch <- e
+		select {
+		case ch <- e:
+		default:
+			// Slow subscriber — drop rather than block the agent loop.
+		}
 	}
 }
 
