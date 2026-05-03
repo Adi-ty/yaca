@@ -82,7 +82,7 @@ type Model struct {
 // New builds the initial Model.
 func New(ag *agent.Agent, providerName, modelName, projectDir string) Model {
 	ta := textarea.New()
-	ta.Placeholder = "Message… (Enter to send, Shift+Enter for newline, Ctrl+C to quit)"
+	ta.Placeholder = "Message… (Enter to send, Alt+Enter for newline, Ctrl+C to quit)"
 	ta.Focus()
 	ta.ShowLineNumbers = false
 	ta.SetHeight(inputLines)
@@ -158,8 +158,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		default:
-			// Shift+Enter inserts a newline.
-			if msg.Type == tea.KeyShiftDown || msg.Alt && msg.Type == tea.KeyEnter {
+			// Alt+Enter inserts a newline; plain keys go to the textarea.
+			if msg.Alt && msg.Type == tea.KeyEnter {
 				m.ta.InsertString("\n")
 			} else {
 				var taCmd tea.Cmd

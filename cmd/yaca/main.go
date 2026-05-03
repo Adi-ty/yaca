@@ -128,8 +128,8 @@ func main() {
 	cfg := resolveConfig(flagSetup)
 	if flagProvider != "" {
 		cfg.Provider = flagProvider
-		// When overriding provider via flag, clear any stale API key if switching to ollama.
-		if flagProvider == "ollama" && cfg.APIKey == "" {
+		// Ollama needs no API key; clear any stale key from a previous provider.
+		if flagProvider == "ollama" {
 			cfg.APIKey = ""
 		}
 	}

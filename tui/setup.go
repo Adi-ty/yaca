@@ -134,6 +134,8 @@ func (m SetupModel) updateProvider(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if pKey == "ollama" {
 			m.step = stepModel
 			m.input.Placeholder = "http://localhost:11434/v1 (default)"
+			m.input.EchoMode = textinput.EchoNormal
+			m.input.EchoCharacter = 0
 			m.input.SetValue("")
 			m.input.Focus()
 			return m, textinput.Blink
@@ -209,15 +211,6 @@ func (m SetupModel) updateModel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if ollamaURL == "" {
 				ollamaURL = "http://localhost:11434/v1"
 			}
-			// For ollama, the "model" step is really the URL step.
-			// Re-use input for actual model name.
-			m.step = stepModel
-			m.input.Placeholder = config.DefaultModel("ollama")
-			m.input.SetValue("")
-			m.input.Focus()
-			// Hack: we need a second model step for ollama. Use a sentinel.
-			// Simplification: combine URL + model into single step via placeholder swap.
-			// For now, just use the value as ollama URL.
 			cfg := &config.Config{
 				Provider:  "ollama",
 				Model:     config.DefaultModel("ollama"),
