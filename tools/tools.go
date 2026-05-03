@@ -156,7 +156,7 @@ func BashTool() agent.Tool {
 		InputSchema: objectSchema(
 			propMap{
 				"command": strProp("The bash command to execute"),
-				"timeout": strProp("Timeout in seconds (optional, default 120)"),
+				"timeout": numProp("Timeout in seconds (optional, default 120)"),
 			},
 			[]string{"command"},
 		),
@@ -378,6 +378,10 @@ func strParam(input map[string]any, key string) (string, error) {
 		return "", fmt.Errorf("parameter %q must be a string, got %T", key, v)
 	}
 	return s, nil
+}
+
+func numProp(description string) map[string]any {
+	return map[string]any{"type": "number", "description": description}
 }
 
 func strParamOpt(input map[string]any, key, def string) string {

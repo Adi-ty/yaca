@@ -259,3 +259,123 @@ func TestListDirTool_MissingDir(t *testing.T) {
 		t.Fatal("expected error for missing directory")
 	}
 }
+
+// ── ReadTool truncation ───────────────────────────────────────────────────────
+
+func TestReadTool_Truncation(t *testing.T) {
+	read := tool(t, "read")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.txt")
+
+	// Write 2100 lines so truncation triggers.
+	var sb strings.Builder
+	for i := 1; i <= 2100; i++ {
+		sb.WriteString("line\n")
+	}
+	if err := os.WriteFile(path, []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := read(map[string]any{"path": path})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasPrefix(out, "[truncated: showing first 2000 of") {
+		t.Errorf("expected truncation header, got: %q", out[:min(80, len(out))])
+	}
+	// Strip the header line before counting content lines.
+	bodyStart := strings.Index(out, "\n")
+	body := out[bodyStart+1:]
+	got := len(strings.Split(strings.TrimRight(body, "\n"), "\n"))
+	if got != 2000 {
+		t.Errorf("expected 2000 lines after truncation, got %d", got)
+	}
+}
+
+func TestReadTool_NoTruncation(t *testing.T) {
+	read := tool(t, "read")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "small.txt")
+
+	var sb strings.Builder
+	for i := 1; i <= 100; i++ {
+		sb.WriteString("line\n")
+	}
+	if err := os.WriteFile(path, []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := read(map[string]any{"path": path})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(out, "[truncated") {
+		t.Error("small file should not be truncated")
+	}
+}
+
+// ── MemoryTool name validation ────────────────────────────────────────────────
+
+func TestMemoryWriteTool_ValidName(t *testing.T) {
+	memWrite := tool(t, "memory_write")
+	memRead := tool(t, "memory_read")
+
+	// Valid names: alphanumeric, hyphens, underscores.
+	for _, name := range []string{"foo", "my-note", "project_ctx", "Note123"} {
+		_, err := memWrite(map[string]any{"name": name, "content": "hello"})
+		if err != nil {
+			t.Errorf("valid name %q rejected: %v", name, err)
+		}
+		out, err := memRead(map[string]any{"name": name})
+		if err != nil {
+			t.Errorf("memory_read failed for valid name %q: %v", name, err)
+		}
+		if out != "hello" {
+			t.Errorf("memory_read returned %q, want %q", out, "hello")
+		}
+	}
+}
+
+func TestMemoryWriteTool_InvalidName(t *testing.T) {
+	memWrite := tool(t, "memory_write")
+
+	// These names must be rejected to prevent path traversal.
+	for _, name := range []string{"../x", "../../etc/passwd", "foo/bar", "a b", "foo.md", ""} {
+		_, err := memWrite(map[string]any{"name": name, "content": "bad"})
+		if err == nil {
+			t.Errorf("invalid name %q should have been rejected", name)
+		}
+	}
+}
+
+func TestMemoryReadTool_InvalidName(t *testing.T) {
+	memRead := tool(t, "memory_read")
+
+	for _, name := range []string{"../x", "../../etc/passwd", "foo/bar", ""} {
+		_, err := memRead(map[string]any{"name": name})
+		if err == nil {
+			t.Errorf("invalid name %q should have been rejected", name)
+		}
+	}
+}
+
+func TestMemoryReadTool_NotFound(t *testing.T) {
+	memRead := tool(t, "memory_read")
+
+	out, err := memRead(map[string]any{"name": "does-not-exist-xyz"})
+	if err != nil {
+		t.Fatalf("not-found should not error, got: %v", err)
+	}
+	if !strings.Contains(out, "no memory named") {
+		t.Errorf("expected not-found message, got: %q", out)
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

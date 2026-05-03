@@ -26,15 +26,16 @@ type Session struct {
 	Messages    []ai.Message `json:"messages"`
 }
 
-// projectHash returns an 8-character hex hash of the absolute path.
-// This creates a stable short identifier for the sessions subdirectory.
+// projectHash returns a 16-character hex hash of the absolute path.
+// This creates a stable short identifier for the sessions subdirectory
+// while making collisions between different project paths impractical.
 func projectHash(projectPath string) string {
 	abs, err := filepath.Abs(projectPath)
 	if err != nil {
 		abs = projectPath
 	}
 	h := sha256.Sum256([]byte(abs))
-	return hex.EncodeToString(h[:4]) // 4 bytes = 8 hex chars
+	return hex.EncodeToString(h[:8]) // 8 bytes = 16 hex chars
 }
 
 // dir returns (creating if needed) the ~/.yaca/sessions/<hash> directory
