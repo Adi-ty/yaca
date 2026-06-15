@@ -130,21 +130,105 @@ func EditTool() agent.Tool {
 			if err != nil {
 				return "", fmt.Errorf("edit: read: %w", err)
 			}
+
+			// Match against a line-ending-normalised view so a CRLF file does
+			// not spuriously miss an old_string that uses plain "\n". The
+			// file's original ending style is restored before writing.
 			content := string(data)
-			n := strings.Count(content, oldStr)
-			switch {
-			case n == 0:
-				return "", fmt.Errorf("edit: old_string not found in %s", path)
-			case n > 1:
-				return "", fmt.Errorf("edit: old_string appears %d times in %s (must appear exactly once)", n, path)
+			crlf := strings.Contains(content, "\r\n")
+			work := strings.ReplaceAll(content, "\r\n", "\n")
+			normOld := strings.ReplaceAll(oldStr, "\r\n", "\n")
+			normNew := strings.ReplaceAll(newStr, "\r\n", "\n")
+
+			idxs := allIndexes(work, normOld)
+			switch len(idxs) {
+			case 0:
+				return "", editNotFoundErr(path, work, normOld)
+			case 1:
+				// ok
+			default:
+				return "", editAmbiguousErr(path, work, idxs)
 			}
-			updated := strings.Replace(content, oldStr, newStr, 1)
+
+			updated := work[:idxs[0]] + normNew + work[idxs[0]+len(normOld):]
+			if crlf {
+				updated = strings.ReplaceAll(updated, "\n", "\r\n")
+			}
 			if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
 				return "", fmt.Errorf("edit: write: %w", err)
 			}
-			return fmt.Sprintf("edited %s", path), nil
+			line := 1 + strings.Count(work[:idxs[0]], "\n")
+			return fmt.Sprintf("edited %s at line %d", path, line), nil
 		},
 	}
+}
+
+// allIndexes returns the byte offsets of every non-overlapping occurrence of
+// sub in s (same counting semantics as strings.Count).
+func allIndexes(s, sub string) []int {
+	if sub == "" {
+		return nil
+	}
+	var idxs []int
+	for off := 0; ; {
+		i := strings.Index(s[off:], sub)
+		if i < 0 {
+			break
+		}
+		idxs = append(idxs, off+i)
+		off += i + len(sub)
+	}
+	return idxs
+}
+
+// editNotFoundErr builds a recoverable error for a missing old_string, pointing
+// the model at the nearest candidate lines so it can retry with exact text.
+func editNotFoundErr(path, content, old string) error {
+	hint := ""
+	if needle := firstNonBlankLine(old); needle != "" {
+		if cands := candidateLines(content, needle, 3); len(cands) > 0 {
+			hint = "\nNearest lines in the file:\n" + strings.Join(cands, "\n")
+		}
+	}
+	return fmt.Errorf("edit: old_string not found in %s. Whitespace and indentation "+
+		"must match exactly — re-read the file and copy the text verbatim.%s", path, hint)
+}
+
+// editAmbiguousErr builds a recoverable error for a non-unique old_string,
+// listing each match location so the model can add disambiguating context.
+func editAmbiguousErr(path, content string, idxs []int) error {
+	locs := make([]string, len(idxs))
+	for i, off := range idxs {
+		line := 1 + strings.Count(content[:off], "\n")
+		locs[i] = fmt.Sprintf("  line %d", line)
+	}
+	return fmt.Errorf("edit: old_string appears %d times in %s (must be unique):\n%s\n"+
+		"Add more surrounding context to old_string so it matches exactly one location.",
+		len(idxs), path, strings.Join(locs, "\n"))
+}
+
+func firstNonBlankLine(s string) string {
+	for _, ln := range strings.Split(s, "\n") {
+		if t := strings.TrimSpace(ln); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+// candidateLines returns up to maxN file lines containing needle, formatted with
+// their 1-based line numbers.
+func candidateLines(content, needle string, maxN int) []string {
+	var out []string
+	for i, ln := range strings.Split(content, "\n") {
+		if strings.Contains(ln, needle) {
+			out = append(out, fmt.Sprintf("  line %d: %s", i+1, strings.TrimSpace(ln)))
+			if len(out) >= maxN {
+				break
+			}
+		}
+	}
+	return out
 }
 
 // ── BashTool ──────────────────────────────────────────────────────────────────

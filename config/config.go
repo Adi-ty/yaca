@@ -14,10 +14,11 @@ const Version = "0.1.0"
 
 // Config holds the persisted provider credentials and preferences.
 type Config struct {
-	Provider  string `json:"provider"`            // "anthropic" | "openai" | "ollama"
-	APIKey    string `json:"api_key,omitempty"`   // not set for Ollama
-	Model     string `json:"model,omitempty"`     // empty means use provider default
+	Provider  string `json:"provider"`             // "anthropic" | "openai" | "ollama"
+	APIKey    string `json:"api_key,omitempty"`    // not set for Ollama / keyless local servers
+	Model     string `json:"model,omitempty"`      // empty means use provider default
 	OllamaURL string `json:"ollama_url,omitempty"` // defaults to http://localhost:11434/v1
+	BaseURL   string `json:"base_url,omitempty"`   // custom OpenAI-compatible endpoint (vLLM/LM Studio/Groq)
 }
 
 // DefaultModel returns the recommended default model for each provider.
