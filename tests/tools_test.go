@@ -149,6 +149,98 @@ func TestEditTool_Ambiguous(t *testing.T) {
 	}
 }
 
+func TestEditTool_AmbiguousMessageHasLineNumbers(t *testing.T) {
+	write := tool(t, "write")
+	edit := tool(t, "edit")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	write(map[string]any{"path": path, "content": "x\nfoo\ny\nfoo\n"}) //nolint
+
+	_, err := edit(map[string]any{
+		"path":       path,
+		"old_string": "foo",
+		"new_string": "bar",
+	})
+	if err == nil {
+		t.Fatal("expected ambiguous error")
+	}
+	// Error should point at both occurrences (lines 2 and 4) so the model can
+	// disambiguate.
+	if !strings.Contains(err.Error(), "line 2") || !strings.Contains(err.Error(), "line 4") {
+		t.Errorf("ambiguous error missing line numbers: %v", err)
+	}
+}
+
+func TestEditTool_NotFoundHasGuidance(t *testing.T) {
+	write := tool(t, "write")
+	edit := tool(t, "edit")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	write(map[string]any{"path": path, "content": "func main() {\n\treturn\n}\n"}) //nolint
+
+	_, err := edit(map[string]any{
+		"path":       path,
+		"old_string": "func main() { return }", // wrong: collapsed whitespace
+		"new_string": "x",
+	})
+	if err == nil {
+		t.Fatal("expected not-found error")
+	}
+	if !strings.Contains(err.Error(), "match exactly") {
+		t.Errorf("not-found error missing guidance: %v", err)
+	}
+}
+
+func TestEditTool_CRLFFile(t *testing.T) {
+	write := tool(t, "write")
+	edit := tool(t, "edit")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "crlf.txt")
+	// File uses CRLF endings; old_string uses plain LF as a model would emit.
+	write(map[string]any{"path": path, "content": "alpha\r\nbeta\r\ngamma\r\n"}) //nolint
+
+	if _, err := edit(map[string]any{
+		"path":       path,
+		"old_string": "beta",
+		"new_string": "BETA",
+	}); err != nil {
+		t.Fatalf("CRLF edit failed: %v", err)
+	}
+
+	data, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), "BETA") {
+		t.Errorf("edit not applied: %q", data)
+	}
+	// CRLF line endings must be preserved.
+	if !strings.Contains(string(data), "\r\n") {
+		t.Errorf("CRLF endings not preserved: %q", data)
+	}
+}
+
+func TestEditTool_ReportsLineNumber(t *testing.T) {
+	write := tool(t, "write")
+	edit := tool(t, "edit")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	write(map[string]any{"path": path, "content": "one\ntwo\nthree\n"}) //nolint
+
+	out, err := edit(map[string]any{
+		"path":       path,
+		"old_string": "three",
+		"new_string": "3",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "line 3") {
+		t.Errorf("expected success message to report line 3, got %q", out)
+	}
+}
+
 // ── BashTool ──────────────────────────────────────────────────────────────────
 
 func TestBashTool(t *testing.T) {

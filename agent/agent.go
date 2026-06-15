@@ -166,6 +166,10 @@ func (a *Agent) Send(ctx context.Context, userText string) {
 
 // ── core loop ─────────────────────────────────────────────────────────────────
 
+// defaultMaxTurns bounds a single Send so a misbehaving model that keeps
+// emitting tool calls cannot loop forever.
+const defaultMaxTurns = 25
+
 func (a *Agent) loop(ctx context.Context, userText string) {
 	a.emit(Event{Type: EventAgentStart})
 
@@ -174,9 +178,24 @@ func (a *Agent) loop(ctx context.Context, userText string) {
 		Content: []ai.ContentBlock{{Type: ai.ContentTypeText, Text: userText}},
 	})
 
+	maxTurns := a.cfg.MaxTurns
+	if maxTurns <= 0 {
+		maxTurns = defaultMaxTurns
+	}
+
 	var totalUsage ai.Usage
 
-	for {
+	for turn := 0; ; turn++ {
+		if turn >= maxTurns {
+			a.emit(Event{Type: EventError,
+				Err: fmt.Errorf("agent: reached max %d turns without completing", maxTurns)})
+			a.emit(Event{Type: EventAgentEnd, Usage: totalUsage})
+			return
+		}
+
+		// Summarise older history before it overflows the context window.
+		a.maybeCompact(ctx)
+
 		a.emit(Event{Type: EventTurnStart})
 
 		// Build request from a snapshot so the mutex isn't held during I/O.
@@ -331,9 +350,44 @@ func (a *Agent) executeTool(ctx context.Context, call ai.ContentBlock) ai.Conten
 			return result
 		}
 	}
-	result.ToolResultContent = fmt.Sprintf("tool %q not found", call.ToolName)
+	result.ToolResultContent = fmt.Sprintf(
+		"no tool named %q. Available tools: %s. Re-issue the call using one of "+
+			"these exact names inside a <tool_call> block.",
+		call.ToolName, a.toolNames())
 	result.IsError = true
 	return result
+}
+
+// toolNames returns a comma-separated list of registered tool names.
+func (a *Agent) toolNames() string {
+	names := make([]string, len(a.cfg.Tools))
+	for i, t := range a.cfg.Tools {
+		names[i] = t.Name
+	}
+	return strings.Join(names, ", ")
+}
+
+// maybeCompact summarises older history once its character count exceeds
+// cfg.CompactThreshold, keeping the loop within the model's context window.
+// Compaction is best-effort: a failure leaves history untouched.
+func (a *Agent) maybeCompact(ctx context.Context) {
+	if a.cfg.CompactThreshold <= 0 {
+		return
+	}
+
+	a.mu.RLock()
+	total := 0
+	for _, m := range a.state.Messages {
+		for _, b := range m.Content {
+			total += len(b.Text) + len(b.ToolResultContent)
+		}
+	}
+	a.mu.RUnlock()
+
+	if total < a.cfg.CompactThreshold {
+		return
+	}
+	_ = a.Compact(ctx) // Compact no-ops when there is too little to summarise.
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

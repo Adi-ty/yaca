@@ -70,4 +70,13 @@ type Config struct {
 	Tools       []Tool
 	MaxTokens   int
 	Temperature *float64
+
+	// MaxTurns caps the number of LLM calls in a single Send before the loop
+	// gives up (guards against a model that never stops calling tools).
+	// Zero means use the package default.
+	MaxTurns int
+
+	// CompactThreshold auto-compacts history once the total character count of
+	// all message content exceeds this value. Zero disables auto-compaction.
+	CompactThreshold int
 }

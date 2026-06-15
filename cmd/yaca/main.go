@@ -19,45 +19,21 @@ import (
 	"github.com/Adi-ty/yaca/tui"
 )
 
-const baseSystemPrompt = `You are YACA, an autonomous coding agent. You work EXCLUSIVELY through tool calls. You never describe what you are going to do — you just do it.
+// baseSystemPrompt holds YACA's behavioural rules. The catalogue of tools and
+// the exact <tool_call> format are appended automatically by the provider
+// (see ai.BuildToolSystemPrompt), so they are deliberately not duplicated here.
+const baseSystemPrompt = `You are YACA, an autonomous coding agent operating in a terminal. You complete tasks by calling tools — never by describing what the user should do.
 
-AVAILABLE TOOLS (use these, never substitute with prose):
-  read        — read a file's contents
-  write       — create or overwrite a file
-  edit        — replace an exact string in a file (read first to confirm uniqueness)
-  bash        — run any shell command
-  glob        — find files by name pattern (e.g. **/*.go)
-  grep        — search file contents with a regex
-  list_dir    — list directory entries
-  fetch       — HTTP GET a URL and return its text
-  memory_read — recall a named note saved by memory_write
-  memory_write— save a named note that persists across sessions
+Operating rules:
+- To act — create or edit files, run commands, search, browse, remember — CALL A TOOL. The available tools and the exact call format are described below.
+- Prefer doing over explaining: do not ask for confirmation on a clear instruction, and do not narrate a plan you could simply execute.
+- CREATE a file → write (the "content" argument holds the complete file text).
+- EDIT a file → read it first, then edit with an exact old_string/new_string pair. If an edit fails because old_string is missing or not unique, re-read the file and copy the text verbatim with more surrounding context.
+- RUN a command → bash. Never tell the user to run it themselves.
+- SEARCH → glob or grep. Never guess file paths.
+- Never paste file contents in a markdown code block instead of calling write.
 
-TOOL MANDATE — absolute, non-negotiable rules:
-
-• CREATE a file  → call write immediately. The "content" field must hold the complete file text.
-• EDIT a file    → call read first, then call edit with an exact old_string/new_string pair.
-• RUN a command  → call bash. Never ask the user to run it themselves.
-• SEARCH files   → call glob or grep. Never guess paths.
-• BROWSE the web → call fetch.
-• REMEMBER info  → call memory_write. Recall it with memory_read.
-
-WHAT YOU MUST NEVER DO:
-✗ Output file contents inside a markdown code block instead of calling write.
-✗ Say "here is what the file should contain" or "you could write…".
-✗ Ask for confirmation before acting on a clear instruction.
-✗ Suggest shell commands for the user to paste — use bash instead.
-
-WHAT CORRECT BEHAVIOUR LOOKS LIKE:
-  User: "write a CONTRIBUTING.md"
-  You:  [call write("CONTRIBUTING.md", <full content>)]  →  "Created CONTRIBUTING.md."
-
-  User: "add error handling to utils.go"
-  You:  [call read("utils.go")]  →  [call edit(...)]  →  "Done. Added error handling to utils.go."
-
-If a task needs multiple steps, chain tool calls until it is complete. Do not stop after one step and ask what to do next. Do not narrate — act.
-
-After finishing, give a short summary of what was done (file names changed, commands run, result).`
+Work in steps: chain tool calls until the task is complete. When finished, reply with a short plain-text summary of what changed (files, commands, results).`
 
 func main() {
 	// .env is optional.
@@ -68,6 +44,7 @@ func main() {
 		flagDir      string
 		flagModel    string
 		flagProvider string
+		flagBaseURL  string
 		flagContinue bool
 		flagSetup    bool
 		flagVersion  bool
@@ -78,6 +55,7 @@ func main() {
 	flag.StringVar(&flagModel, "m", "", "override model (shorthand)")
 	flag.StringVar(&flagProvider, "provider", "", "override `provider` (anthropic, openai, ollama)")
 	flag.StringVar(&flagProvider, "p", "", "override provider (shorthand)")
+	flag.StringVar(&flagBaseURL, "base-url", "", "custom OpenAI-compatible base `url` (e.g. http://localhost:1234/v1 for LM Studio/vLLM)")
 	flag.BoolVar(&flagContinue, "continue", false, "continue last session for this project")
 	flag.BoolVar(&flagContinue, "c", false, "continue last session (shorthand)")
 	flag.BoolVar(&flagSetup, "setup", false, "reconfigure provider/API key")
@@ -125,13 +103,16 @@ func main() {
 	}
 
 	// ── Provider / API key resolution ──────────────────────────────────────────
-	cfg := resolveConfig(flagSetup)
+	cfg := resolveConfig(flagSetup, flagProvider, flagBaseURL)
 	if flagProvider != "" {
 		cfg.Provider = flagProvider
 		// Ollama needs no API key; clear any stale key from a previous provider.
 		if flagProvider == "ollama" {
 			cfg.APIKey = ""
 		}
+	}
+	if flagBaseURL != "" {
+		cfg.BaseURL = flagBaseURL
 	}
 	if flagModel != "" {
 		cfg.Model = flagModel
@@ -151,6 +132,10 @@ func main() {
 		System:    systemPrompt,
 		Tools:     tools.All(),
 		MaxTokens: 8192,
+		MaxTurns:  25,
+		// Auto-summarise history once it grows past ~40k chars (~10k tokens) so
+		// long sessions stay within local models' context windows.
+		CompactThreshold: 40000,
 	})
 
 	// ── Session: load project-scoped history ───────────────────────────────────
@@ -196,10 +181,23 @@ func main() {
 }
 
 // resolveConfig loads credentials with this priority:
-//  1. Environment variables (ANTHROPIC_API_KEY, OPENAI_API_KEY)
-//  2. ~/.yaca/config.json
-//  3. In-app setup wizard (if --setup or nothing configured)
-func resolveConfig(forceSetup bool) *config.Config {
+//  1. Explicit keyless endpoints chosen via flags (ollama, or openai --base-url)
+//  2. Environment variables (ANTHROPIC_API_KEY, OPENAI_API_KEY)
+//  3. ~/.yaca/config.json
+//  4. In-app setup wizard (if --setup or nothing configured)
+func resolveConfig(forceSetup bool, flagProvider, flagBaseURL string) *config.Config {
+	// Explicit local / custom OpenAI-compatible targets need no wizard or key.
+	if !forceSetup {
+		switch flagProvider {
+		case "ollama":
+			return &config.Config{Provider: "ollama"}
+		case "openai":
+			if flagBaseURL != "" {
+				return &config.Config{Provider: "openai", BaseURL: flagBaseURL, APIKey: os.Getenv("OPENAI_API_KEY")}
+			}
+		}
+	}
+
 	// Env vars take highest priority.
 	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" && !forceSetup {
 		return &config.Config{Provider: "anthropic", APIKey: key}
@@ -242,7 +240,11 @@ func buildProvider(cfg *config.Config) (name, model string, p ai.Provider) {
 	case "anthropic":
 		return "anthropic", cfg.Model, ai.NewAnthropicProvider(cfg.APIKey)
 	case "openai":
-		return "openai", cfg.Model, ai.NewOpenAI(cfg.APIKey)
+		baseURL := cfg.BaseURL
+		if baseURL == "" {
+			baseURL = envOr("OPENAI_BASE_URL", "")
+		}
+		return "openai", cfg.Model, ai.NewOpenAI(cfg.APIKey, baseURL)
 	default:
 		url := cfg.OllamaURL
 		if url == "" {

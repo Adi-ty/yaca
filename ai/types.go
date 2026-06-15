@@ -121,6 +121,9 @@ type Request struct {
 	Tools      []ToolSchema
 	MaxTokens  int
 	Temperature *float64 // nil = provider default
+	// Stop holds caller-supplied stop sequences. Providers always add the XML
+	// tool-call stop sequence (ToolStopSeq) on top of these when Tools is set.
+	Stop []string
 }
 
 // Response is the non-streaming result of Provider.Complete.

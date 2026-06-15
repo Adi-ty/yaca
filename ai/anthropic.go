@@ -11,12 +11,17 @@ import (
 )
 
 const (
-	anthropicAPIBase  = "https://api.anthropic.com"
-	anthropicVersion  = "2023-06-01"
-	defaultMaxTokens  = 8192
+	anthropicAPIBase = "https://api.anthropic.com"
+	anthropicVersion = "2023-06-01"
+	defaultMaxTokens = 8192
 )
 
 // AnthropicProvider implements Provider against Anthropic's Messages API.
+//
+// Tool calling uses the shared XML protocol (see xmltools.go) rather than
+// Anthropic's native tool_use blocks: tools are described in the system prompt
+// and the conversation is sent as plain-text turns. This keeps every provider
+// on one tool-calling code path.
 type AnthropicProvider struct {
 	apiKey     string
 	httpClient *http.Client
@@ -35,16 +40,8 @@ func (p *AnthropicProvider) Name() string { return "anthropic" }
 // ── wire types ────────────────────────────────────────────────────────────────
 
 type anthropicBlock struct {
-	Type      string         `json:"type"`
-	Text      string         `json:"text,omitempty"`
-	Thinking  string         `json:"thinking,omitempty"`
-	ID        string         `json:"id,omitempty"`
-	Name      string         `json:"name,omitempty"`
-	Input     map[string]any `json:"input,omitempty"`
-	ToolUseID string         `json:"tool_use_id,omitempty"`
-	// tool_result content may be a plain string
-	Content string `json:"content,omitempty"`
-	IsError bool   `json:"is_error,omitempty"`
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
 }
 
 type anthropicWireMessage struct {
@@ -52,19 +49,13 @@ type anthropicWireMessage struct {
 	Content []anthropicBlock `json:"content"`
 }
 
-type anthropicTool struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	InputSchema map[string]any `json:"input_schema"`
-}
-
 type anthropicReq struct {
-	Model     string                 `json:"model"`
-	MaxTokens int                    `json:"max_tokens"`
-	System    string                 `json:"system,omitempty"`
-	Messages  []anthropicWireMessage `json:"messages"`
-	Tools     []anthropicTool        `json:"tools,omitempty"`
-	Stream    bool                   `json:"stream"`
+	Model         string                 `json:"model"`
+	MaxTokens     int                    `json:"max_tokens"`
+	System        string                 `json:"system,omitempty"`
+	Messages      []anthropicWireMessage `json:"messages"`
+	StopSequences []string               `json:"stop_sequences,omitempty"`
+	Stream        bool                   `json:"stream"`
 }
 
 // ── SSE event shapes ──────────────────────────────────────────────────────────
@@ -77,27 +68,12 @@ type sseMessageStart struct {
 	} `json:"message"`
 }
 
-type sseBlockStart struct {
-	Index        int `json:"index"`
-	ContentBlock struct {
-		Type string `json:"type"`
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	} `json:"content_block"`
-}
-
 type sseBlockDelta struct {
-	Index int `json:"index"`
 	Delta struct {
-		Type        string `json:"type"`
-		Text        string `json:"text"`
-		Thinking    string `json:"thinking"`
-		PartialJSON string `json:"partial_json"`
+		Type     string `json:"type"`
+		Text     string `json:"text"`
+		Thinking string `json:"thinking"`
 	} `json:"delta"`
-}
-
-type sseBlockStop struct {
-	Index int `json:"index"`
 }
 
 type sseMessageDelta struct {
@@ -111,54 +87,21 @@ type sseMessageDelta struct {
 
 // ── conversion helpers ────────────────────────────────────────────────────────
 
+// toWireMessages flattens the structured history into single-text-block messages.
+// Anthropic accepts only "user" and "assistant" roles; the system prompt is sent
+// separately, so any stray system turn is folded into a user message.
 func toWireMessages(msgs []Message) []anthropicWireMessage {
-	out := make([]anthropicWireMessage, len(msgs))
-	for i, m := range msgs {
-		wm := anthropicWireMessage{Role: string(m.Role)}
-		for _, cb := range m.Content {
-			wm.Content = append(wm.Content, toWireBlock(cb))
+	flat := FlattenMessages(msgs)
+	out := make([]anthropicWireMessage, 0, len(flat))
+	for _, fm := range flat {
+		role := "user"
+		if fm.Role == RoleAssistant {
+			role = "assistant"
 		}
-		out[i] = wm
-	}
-	return out
-}
-
-func toWireBlock(cb ContentBlock) anthropicBlock {
-	switch cb.Type {
-	case ContentTypeText:
-		return anthropicBlock{Type: "text", Text: cb.Text}
-	case ContentTypeThinking:
-		return anthropicBlock{Type: "thinking", Thinking: cb.Text}
-	case ContentTypeToolCall:
-		return anthropicBlock{
-			Type:  "tool_use",
-			ID:    cb.ToolCallID,
-			Name:  cb.ToolName,
-			Input: cb.ToolInput,
-		}
-	case ContentTypeToolResult:
-		return anthropicBlock{
-			Type:      "tool_result",
-			ToolUseID: cb.ToolResultID,
-			Content:   cb.ToolResultContent,
-			IsError:   cb.IsError,
-		}
-	default:
-		return anthropicBlock{Type: "text", Text: cb.Text}
-	}
-}
-
-func toWireTools(tools []ToolSchema) []anthropicTool {
-	if len(tools) == 0 {
-		return nil
-	}
-	out := make([]anthropicTool, len(tools))
-	for i, t := range tools {
-		out[i] = anthropicTool{
-			Name:        t.Name,
-			Description: t.Description,
-			InputSchema: t.InputSchema,
-		}
+		out = append(out, anthropicWireMessage{
+			Role:    role,
+			Content: []anthropicBlock{{Type: "text", Text: fm.Text}},
+		})
 	}
 	return out
 }
@@ -217,14 +160,6 @@ func (p *AnthropicProvider) ListModels(ctx context.Context) ([]Model, error) {
 
 // ── Stream ────────────────────────────────────────────────────────────────────
 
-// blockAccum accumulates state for one content block while streaming.
-type blockAccum struct {
-	kind      string // "text" | "tool_use" | "thinking"
-	toolID    string
-	toolName  string
-	jsonBuf   strings.Builder
-}
-
 func (p *AnthropicProvider) Stream(ctx context.Context, req Request) (<-chan StreamEvent, error) {
 	body, err := p.marshalRequest(req)
 	if err != nil {
@@ -248,11 +183,11 @@ func (p *AnthropicProvider) Stream(ctx context.Context, req Request) (<-chan Str
 	}
 
 	ch := make(chan StreamEvent, 32)
-	go p.consumeSSE(ctx, resp, ch)
+	go p.consumeSSE(ctx, resp, ch, ToolNameSet(req.Tools))
 	return ch, nil
 }
 
-func (p *AnthropicProvider) consumeSSE(ctx context.Context, resp *http.Response, ch chan<- StreamEvent) {
+func (p *AnthropicProvider) consumeSSE(ctx context.Context, resp *http.Response, ch chan<- StreamEvent, known map[string]bool) {
 	defer resp.Body.Close()
 	defer close(ch)
 
@@ -265,7 +200,7 @@ func (p *AnthropicProvider) consumeSSE(ctx context.Context, resp *http.Response,
 		}
 	}
 
-	blocks := map[int]*blockAccum{}
+	streamer := newToolStreamer(send, known)
 	var inputTokens, outputTokens int
 	var stopReason StopReason
 
@@ -283,7 +218,7 @@ func (p *AnthropicProvider) consumeSSE(ctx context.Context, resp *http.Response,
 
 		case strings.HasPrefix(line, "data: "):
 			data := strings.TrimPrefix(line, "data: ")
-			if !p.handleSSEData(eventType, data, blocks,
+			if !p.handleSSEData(eventType, data, streamer,
 				&inputTokens, &outputTokens, &stopReason, send) {
 				return
 			}
@@ -295,11 +230,12 @@ func (p *AnthropicProvider) consumeSSE(ctx context.Context, resp *http.Response,
 	}
 }
 
-// handleSSEData processes one (eventType, data) pair. Returns false if the
-// caller should stop reading (context done or terminal error).
+// handleSSEData processes one (eventType, data) pair. Text deltas are routed
+// through the shared toolStreamer; thinking deltas pass straight through.
+// Returns false if the caller should stop reading.
 func (p *AnthropicProvider) handleSSEData(
 	eventType, data string,
-	blocks map[int]*blockAccum,
+	streamer *toolStreamer,
 	inputTokens, outputTokens *int,
 	stopReason *StopReason,
 	send func(StreamEvent) bool,
@@ -312,65 +248,17 @@ func (p *AnthropicProvider) handleSSEData(
 			*inputTokens = e.Message.Usage.InputTokens
 		}
 
-	case "content_block_start":
-		var e sseBlockStart
-		if err := json.Unmarshal([]byte(data), &e); err != nil {
-			return send(StreamEvent{Type: EventError,
-				Err: fmt.Errorf("anthropic: parse content_block_start: %w", err)})
-		}
-		ba := &blockAccum{kind: e.ContentBlock.Type}
-		if e.ContentBlock.Type == "tool_use" {
-			ba.toolID = e.ContentBlock.ID
-			ba.toolName = e.ContentBlock.Name
-		}
-		blocks[e.Index] = ba
-
 	case "content_block_delta":
 		var e sseBlockDelta
 		if err := json.Unmarshal([]byte(data), &e); err != nil {
 			return send(StreamEvent{Type: EventError,
 				Err: fmt.Errorf("anthropic: parse content_block_delta: %w", err)})
 		}
-		ba := blocks[e.Index]
-		if ba == nil {
-			break
-		}
 		switch e.Delta.Type {
 		case "text_delta":
-			if !send(StreamEvent{Type: EventText, Delta: e.Delta.Text}) {
-				return false
-			}
+			return streamer.feed(e.Delta.Text)
 		case "thinking_delta":
-			if !send(StreamEvent{Type: EventThinking, Delta: e.Delta.Thinking}) {
-				return false
-			}
-		case "input_json_delta":
-			ba.jsonBuf.WriteString(e.Delta.PartialJSON)
-		}
-
-	case "content_block_stop":
-		var e sseBlockStop
-		if err := json.Unmarshal([]byte(data), &e); err != nil {
-			break
-		}
-		ba := blocks[e.Index]
-		if ba == nil || ba.kind != "tool_use" {
-			break
-		}
-		var input map[string]any
-		if raw := ba.jsonBuf.String(); raw != "" {
-			if err := json.Unmarshal([]byte(raw), &input); err != nil {
-				return send(StreamEvent{Type: EventError,
-					Err: fmt.Errorf("anthropic: unmarshal tool input JSON: %w", err)})
-			}
-		}
-		if !send(StreamEvent{
-			Type:       EventToolCall,
-			ToolCallID: ba.toolID,
-			ToolName:   ba.toolName,
-			ToolInput:  input,
-		}) {
-			return false
+			return send(StreamEvent{Type: EventThinking, Delta: e.Delta.Thinking})
 		}
 
 	case "message_delta":
@@ -381,6 +269,9 @@ func (p *AnthropicProvider) handleSSEData(
 		}
 
 	case "message_stop":
+		if !streamer.flush() {
+			return false
+		}
 		return send(StreamEvent{
 			Type:       EventDone,
 			StopReason: *stopReason,
@@ -458,12 +349,12 @@ func (p *AnthropicProvider) marshalRequest(req Request) ([]byte, error) {
 		maxTok = defaultMaxTokens
 	}
 	ar := anthropicReq{
-		Model:     req.Model,
-		MaxTokens: maxTok,
-		System:    req.System,
-		Messages:  toWireMessages(req.Messages),
-		Tools:     toWireTools(req.Tools),
-		Stream:    true,
+		Model:         req.Model,
+		MaxTokens:     maxTok,
+		System:        BuildToolSystemPrompt(req.System, req.Tools),
+		Messages:      toWireMessages(req.Messages),
+		StopSequences: StopSequences(req),
+		Stream:        true,
 	}
 	b, err := json.Marshal(ar)
 	if err != nil {
